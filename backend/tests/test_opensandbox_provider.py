@@ -31,6 +31,8 @@ import pytest
 from deerflow.community.opensandbox.provider import OpenSandboxProvider, _import_sdk
 from deerflow.community.opensandbox.sandbox import OpenSandboxSandbox
 from deerflow.config.paths import Paths
+from deerflow.config.skills_config import SkillsConfig
+from deerflow.skills.projection import SkillProjectionPaths
 
 
 @dataclass
@@ -254,7 +256,7 @@ class _TerminalApiError(RuntimeError):
 
 def _stub_config(attrs: dict[str, Any] | None = None) -> types.SimpleNamespace:
     values = {"idle_timeout": 0, **(attrs or {})}
-    return types.SimpleNamespace(sandbox=types.SimpleNamespace(**values))
+    return types.SimpleNamespace(sandbox=types.SimpleNamespace(**values), skills=SkillsConfig())
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, *, sdk: _FakeSandboxClass | None = None, config: dict[str, Any] | None = None) -> tuple[OpenSandboxProvider, _FakeSandboxClass]:
@@ -571,6 +573,151 @@ def output_sync_provider(monkeypatch, tmp_path):
     sandbox_id = provider.acquire("thread", user_id="owner")
     yield provider, sdk.remotes[0], sandbox_id, paths.sandbox_outputs_dir("thread", user_id="owner")
     provider.shutdown()
+
+
+def _skill_projection(root: Path) -> SkillProjectionPaths:
+    categories = {category: root / category for category in ("public", "custom", "legacy", "integrations")}
+    for path in categories.values():
+        path.mkdir(parents=True)
+    return SkillProjectionPaths(**categories)
+
+
+@pytest.fixture
+def skill_sync_shell(output_sync_provider, monkeypatch, tmp_path):
+    """Run the provider's real transfer commands against a disposable filesystem."""
+    if os.name == "nt" or not shutil.which("sh") or not shutil.which("tar"):
+        pytest.skip("a POSIX shell and tar are required to test skill mode and symlink preservation")
+
+    provider, remote, sandbox_id, _ = output_sync_provider
+    remote_home = tmp_path.resolve() / "remote"
+    remote_tmp = remote_home / "tmp"
+    remote_tmp.mkdir(parents=True)
+    native_skills = remote_home / "mnt" / "skills"
+    native_skills.parent.mkdir()
+    fake_run = remote.commands.run
+
+    def run(command, *, opts=None):
+        if "__DF_OUTPUT_SYNC__" in command:
+            return fake_run(command, opts=opts)
+        remote.commands.calls.append((command, opts))
+        native_command = re.sub(r"/(?:mnt|tmp)\b", lambda match: str(remote_home) + match[0], command)
+        result = subprocess.run(
+            ["sh", "-c", native_command],
+            env={"PATH": os.environ.get("PATH", os.defpath), "TMPDIR": str(remote_tmp)},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=10,
+        )
+        stdout = result.stdout.replace(str(remote_home), "")
+        return _execution(stdout=tuple(stdout.splitlines()), stderr=(result.stderr,), exit_code=result.returncode)
+
+    def write_file(path, data, *, mode=755):
+        remote.files.calls.append(("write_file", path))
+        archive = remote_home / path.lstrip("/")
+        assert archive.is_relative_to(remote_tmp) and mode == 600
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open("wb") as target:
+            if remote.file_error is not None:
+                target.write(data.read(8))
+                raise remote.file_error
+            shutil.copyfileobj(data, target)
+
+    monkeypatch.setattr(remote.commands, "run", run)
+    monkeypatch.setattr(remote.files, "write_file", write_file)
+    return provider, remote, sandbox_id, native_skills, remote_tmp
+
+
+def test_skill_projection_replaces_managed_categories_on_warm_reuse(skill_sync_shell, tmp_path):
+    provider, remote, sandbox_id, native_skills, remote_tmp = skill_sync_shell
+    assert provider.supports_agent_skill_isolation is True
+    native_skills.mkdir()
+    unrelated = native_skills / "image-notes.txt"
+    unrelated.write_bytes(b"bundled by the image")
+
+    initial = _skill_projection(tmp_path / "initial")
+    public_skill = initial.public / "example"
+    public_skill.mkdir()
+    executable = public_skill / "script.sh"
+    executable.write_bytes(b"#!/bin/sh\nprintf 'sample\\n'\n")
+    executable.chmod(0o755)
+    (public_skill / "run.sh").symlink_to("script.sh")
+    (initial.legacy / "example.bin").write_bytes(b"\x00\xff")
+
+    provider.sync_agent_skills(sandbox_id, thread_id="thread", user_id="owner", projection=initial)
+    deployed = native_skills / "public" / "example"
+    assert (deployed / "script.sh").read_bytes() == executable.read_bytes()
+    assert os.access(deployed / "script.sh", os.X_OK)
+    assert (deployed / "run.sh").readlink() == Path("script.sh")
+    assert (native_skills / "legacy" / "example.bin").read_bytes() == b"\x00\xff"
+
+    provider.release(sandbox_id)
+    assert provider.acquire("thread", user_id="owner") == sandbox_id
+    assert provider.get(sandbox_id).remote_id == remote.id
+
+    changed = _skill_projection(tmp_path / "changed")
+    (changed.integrations / "new.bin").write_bytes(b"new skill")
+    provider.sync_agent_skills(sandbox_id, thread_id="thread", user_id="owner", projection=changed)
+    assert not deployed.exists()
+    assert not (native_skills / "legacy" / "example.bin").exists()
+    assert (native_skills / "integrations" / "new.bin").read_bytes() == b"new skill"
+
+    empty = _skill_projection(tmp_path / "empty")
+    provider.sync_agent_skills(sandbox_id, thread_id="thread", user_id="owner", projection=empty)
+    for category in ("public", "custom", "legacy", "integrations"):
+        assert not list((native_skills / category).iterdir())
+    assert unrelated.read_bytes() == b"bundled by the image"
+    assert not list(remote_tmp.iterdir())
+
+
+def test_skill_projection_upload_failure_keeps_previous_view(skill_sync_shell, tmp_path):
+    provider, remote, sandbox_id, native_skills, remote_tmp = skill_sync_shell
+    initial = _skill_projection(tmp_path / "initial")
+    (initial.public / "before.bin").write_bytes(b"previous skill")
+    provider.sync_agent_skills(sandbox_id, thread_id="thread", user_id="owner", projection=initial)
+
+    changed = _skill_projection(tmp_path / "changed")
+    (changed.public / "after.bin").write_bytes(b"replacement skill")
+    uploads_before = len(remote.files.calls)
+    remote.file_error = RuntimeError("OpenSandbox upload failed")
+    with pytest.raises(RuntimeError, match="OpenSandbox upload failed"):
+        provider.sync_agent_skills(sandbox_id, thread_id="thread", user_id="owner", projection=changed)
+
+    assert len(remote.files.calls) == uploads_before + 1
+    assert (native_skills / "public" / "before.bin").read_bytes() == b"previous skill"
+    assert not (native_skills / "public" / "after.bin").exists()
+    assert not list(remote_tmp.iterdir())
+
+
+def test_skill_projection_path_reload_requires_provider_restart(skill_sync_shell, monkeypatch, tmp_path):
+    provider, remote, sandbox_id, native_skills, _ = skill_sync_shell
+    projection = _skill_projection(tmp_path / "projection")
+    (projection.public / "before.bin").write_bytes(b"existing skill")
+    provider.sync_agent_skills(sandbox_id, thread_id="thread", user_id="owner", projection=projection)
+    calls_before = (len(remote.commands.calls), len(remote.files.calls), len(remote.renew_calls))
+
+    reloaded_config = _stub_config()
+    reloaded_config.skills = SkillsConfig(container_path="/mnt/other-skills")
+    monkeypatch.setattr("deerflow.community.opensandbox.provider.get_app_config", lambda: reloaded_config)
+    with pytest.raises(ValueError, match="Restart.*skills.container_path"):
+        provider.sync_agent_skills(sandbox_id, thread_id="thread", user_id="owner", projection=projection)
+
+    assert (len(remote.commands.calls), len(remote.files.calls), len(remote.renew_calls)) == calls_before
+    assert (native_skills / "public" / "before.bin").read_bytes() == b"existing skill"
+
+
+@pytest.mark.parametrize(("thread_id", "user_id"), [("other-thread", "owner"), ("thread", "other-user")])
+def test_skill_projection_scope_mismatch_makes_no_remote_calls(output_sync_provider, tmp_path, thread_id, user_id):
+    provider, remote, sandbox_id, _ = output_sync_provider
+    projection = _skill_projection(tmp_path / "projection")
+    commands_before = len(remote.commands.calls)
+
+    with pytest.raises(RuntimeError):
+        provider.sync_agent_skills(sandbox_id, thread_id=thread_id, user_id=user_id, projection=projection)
+
+    assert not remote.files.calls
+    assert len(remote.commands.calls) == commands_before
 
 
 def test_output_sync_refreshes_existing_content_and_keeps_literal_filename(output_sync_provider):

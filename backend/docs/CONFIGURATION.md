@@ -2204,8 +2204,9 @@ The same semantics apply to `subagents.agents.<name>.skills` and `subagents.cust
 `LocalSandboxProvider` enforces this filesystem view through its managed virtual
 path mappings only. Explicit per-Agent skill policies therefore fail closed when
 `sandbox.allow_host_bash` is enabled, because host subprocesses can bypass those
-mappings. Keep host bash disabled (the default), or use AIO/provisioner/E2B when
-shell access and filesystem isolation are both required.
+mappings. Keep host bash disabled (the default), or use AIO, the Kubernetes
+provisioner, E2B, or [OpenSandbox](../packages/harness/deerflow/community/opensandbox/README.md#per-agent-skills)
+when shell access and per-Agent skill filesystem isolation are both required.
 
 ### Title Generation
 

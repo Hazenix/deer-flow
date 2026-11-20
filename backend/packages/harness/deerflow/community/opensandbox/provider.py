@@ -10,6 +10,7 @@ import math
 import os
 import shlex
 import stat
+import tarfile
 import tempfile
 import threading
 import time
@@ -32,6 +33,9 @@ from ..warm_pool_lifecycle import WarmPoolLifecycleMixin
 from .sandbox import _MAX_DOWNLOAD_SIZE, OpenSandboxSandbox, execution_stdout, format_execution
 
 if TYPE_CHECKING:
+    from typing import BinaryIO
+
+    from deerflow.skills.projection import SkillProjectionPaths
     from opensandbox.config.connection_sync import ConnectionConfigSync
     from opensandbox.models.execd import RunCommandOpts
     from opensandbox.sync import SandboxSync
@@ -45,6 +49,8 @@ DEFAULT_SANDBOX_TIMEOUT = 4 * 60 * 60
 DEFAULT_COMMAND_TIMEOUT = 10 * 60
 _BOOTSTRAP_TIMEOUT = 30.0
 _BOOTSTRAP_COMMAND = "mkdir -p /mnt/user-data/workspace /mnt/user-data/uploads /mnt/user-data/outputs"
+_SKILL_CATEGORIES = ("public", "custom", "legacy", "integrations")
+_PROTECTED_SKILLS_ROOTS = frozenset({"bin", "boot", "dev", "etc", "lib", "lib64", "proc", "root", "run", "sbin", "sys", "usr", "var"})
 _WINDOWS_RESERVED_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"} | {f"{prefix}{digit}" for prefix in ("COM", "LPT") for digit in "123456789¹²³"})
 
 
@@ -82,11 +88,14 @@ class OpenSandboxProvider(WarmPoolLifecycleMixin[OpenSandboxSandbox], SandboxPro
 
     uses_thread_data_mounts = False
     needs_upload_permission_adjustment = True
+    supports_agent_skill_isolation = True
     _idle_checker_thread_name = "opensandbox-idle-reaper"
     _MAX_SYNC_FILES = 2000
     _MAX_SYNC_TOTAL_BYTES = 512 * 1024 * 1024
     _MAX_SYNC_LISTING_BYTES = 512 * 1024
     _SYNC_DEADLINE_SECONDS = 120.0
+    _MAX_SKILL_ENTRIES = 10_000
+    _MAX_SKILL_BYTES = 128 * 1024 * 1024
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -113,7 +122,8 @@ class OpenSandboxProvider(WarmPoolLifecycleMixin[OpenSandboxSandbox], SandboxPro
         return resolved
 
     def _load_config(self) -> dict[str, Any]:
-        sandbox_config = get_app_config().sandbox
+        app_config = get_app_config()
+        sandbox_config = app_config.sandbox
 
         def option(name: str) -> Any:
             return getattr(sandbox_config, name, None)
@@ -181,6 +191,7 @@ class OpenSandboxProvider(WarmPoolLifecycleMixin[OpenSandboxSandbox], SandboxPro
             "sandbox_timeout": None if sandbox_timeout == 0 else sandbox_timeout,
             "command_timeout": self._positive_float("bash_command_timeout", option("bash_command_timeout"), DEFAULT_COMMAND_TIMEOUT),
             "environment": environment,
+            "skills_container_path": app_config.skills.container_path,
             "replicas": replicas if replicas is not None else self.DEFAULT_REPLICAS,
             "idle_timeout": idle_timeout if idle_timeout is not None else self.DEFAULT_IDLE_TIMEOUT,
             "resource": resource_option("resource"),
@@ -400,6 +411,97 @@ class OpenSandboxProvider(WarmPoolLifecycleMixin[OpenSandboxSandbox], SandboxPro
     def get(self, sandbox_id: str) -> Sandbox | None:
         with self._lock:
             return self._sandboxes.get(sandbox_id)
+
+    def sync_agent_skills(self, sandbox_id: str, *, thread_id: str, user_id: str, projection: SkillProjectionPaths) -> None:
+        """Install the prepared thread projection before any Agent tools run."""
+        with self._acquire_serializer.hold(sandbox_id):
+            with self._lock:
+                sandbox = self._sandboxes.get(sandbox_id)
+                scope_matches = self._thread_sandboxes.get(self._thread_key(thread_id, user_id)) == sandbox_id
+            if sandbox is None or not scope_matches:
+                raise RuntimeError("OpenSandbox is not available for skill synchronization in this thread scope")
+
+            skills_path = self._config["skills_container_path"]
+            # A warm sandbox may still contain the previous projection after a
+            # config reload. Require a restart before publishing to a new root.
+            if get_app_config().skills.container_path != skills_path:
+                raise ValueError("Restart the OpenSandbox provider after changing skills.container_path")
+            skills_root = PurePosixPath(skills_path)
+            if (
+                skills_root.anchor != "/"
+                or str(skills_root) != skills_path
+                or ".." in skills_root.parts
+                or "\0" in skills_path
+                or len(skills_root.parts) < 2
+                or skills_root.parts[1] in _PROTECTED_SKILLS_ROOTS
+                or (skills_root.parts[1] == "home" and len(skills_root.parts) <= 3)
+                or skills_path == "/tmp"
+                or skills_root.is_relative_to("/mnt/user-data")
+                or PurePosixPath("/mnt/user-data").is_relative_to(skills_root)
+            ):
+                raise ValueError("skills.container_path must be a dedicated, normalized absolute OpenSandbox path")
+
+            with tempfile.TemporaryFile() as payload:
+                self._write_skill_archive(payload, projection)
+                payload.seek(0)
+                self._replace_remote_skills(sandbox, skills_root, payload)
+
+    def _write_skill_archive(self, payload: BinaryIO, projection: SkillProjectionPaths) -> None:
+        from deerflow.skills.projection import _projection_lock
+
+        count = total_bytes = 0
+
+        def admit(entry: tarfile.TarInfo) -> tarfile.TarInfo:
+            nonlocal count, total_bytes
+            count += 1
+            total_bytes += entry.size
+            if count > self._MAX_SKILL_ENTRIES or total_bytes > self._MAX_SKILL_BYTES:
+                raise ValueError("OpenSandbox skills projection exceeds the upload limit")
+            if not (entry.isfile() or entry.isdir() or entry.issym() or entry.islnk()):
+                raise ValueError("OpenSandbox skills projection contains an unsupported file type")
+            entry.mode &= 0o777
+            return entry
+
+        # The projection builder validates package links. Hold its lock while
+        # archiving so a concurrent rebuild cannot change the validated tree.
+        with _projection_lock(projection.public.parent, timeout=5), tarfile.open(fileobj=payload, mode="w:gz") as archive:
+            for category in _SKILL_CATEGORIES:
+                source = getattr(projection, category)
+                if not source.is_dir() or source.is_symlink():
+                    raise ValueError(f"Invalid OpenSandbox skill projection category: {category}")
+                archive.add(source, arcname=category, filter=admit)
+
+    def _replace_remote_skills(self, sandbox: OpenSandboxSandbox, skills_root: PurePosixPath, payload: BinaryIO) -> None:
+        stage_path = f"/tmp/deerflow-skills-{uuid.uuid4().hex}"
+        stage = shlex.quote(stage_path)
+        root = shlex.quote(str(skills_root))
+        checked_dirs = (skills_root, *skills_root.parents)
+        no_links = " && ".join(f"[ ! -L {shlex.quote(str(directory))} ]" for directory in checked_dirs)
+
+        def run(command: str, operation: str) -> None:
+            execution = sandbox._run(command, timeout=self._SYNC_DEADLINE_SECONDS)
+            code = getattr(execution, "exit_code", None)
+            if code != 0 or getattr(execution, "error", None) is not None:
+                detail = format_execution(execution).strip() or f"exit code {code}"
+                raise RuntimeError(f"OpenSandbox skills {operation} failed: {detail}")
+
+        run(f"set -e; [ ! -L /tmp ]; mkdir -m 700 -- {stage}", "staging")
+        try:
+            sandbox._file_op(lambda files: files.write_file(f"{stage_path}/skills.tar.gz", payload, mode=600))
+            categories = " ".join(_SKILL_CATEGORIES)
+            # Validate the complete archive before touching the active view.
+            # Only the four categories owned by DeerFlow are replaced.
+            run(
+                f"set -e; {no_links} || exit 1; [ ! -L {stage} ]; "
+                f"mkdir -- {stage}/view; tar -xzf {stage}/skills.tar.gz -C {stage}/view --no-same-owner; mkdir -p -- {root}; "
+                f'for category in {categories}; do rm -rf -- {root}/"$category"; mv -- {stage}/view/"$category" {root}/"$category"; done',
+                "publication",
+            )
+        finally:
+            try:
+                run(f"set -e; [ ! -L /tmp ]; rm -rf -- {stage}", "staging cleanup")
+            except Exception:
+                logger.warning("Could not clean up staged OpenSandbox skills for %s", sandbox.id, exc_info=True)
 
     def release(self, sandbox_id: str) -> None:
         # Same scope lock as acquire: no next turn may reuse a client while its

@@ -117,6 +117,26 @@ Operations are serialized per remote so a shorter renewal cannot overwrite the
 horizon of an in-flight long command.
 Setting `sandbox_timeout: 0` selects explicit-cleanup mode and disables renewal.
 
+### Per-Agent Skills
+
+When a lead Agent sets an explicit `skills` list, DeerFlow synchronizes the
+thread's skill files into the OpenSandbox environment before the Agent starts.
+Each run with a thread skill projection replaces the managed skill directories,
+including on a reused sandbox. `skills: []` clears those directories. A failed
+synchronization aborts the run before the Agent starts.
+
+The sandbox image needs `tar` with gzip support. Use a dedicated
+`skills.container_path`, such as `/mnt/skills`, outside `/mnt/user-data`.
+Each projection is limited to 10,000 archive entries and 128 MiB of file data.
+Restart the Gateway after changing this path so a reused sandbox cannot
+carry a projection at the old location.
+
+If a thread that has a skill projection switches to `skills: null` or omits the
+field, its next run synchronizes all enabled Skills. OpenSandbox synchronizes
+skill files only for threads that have a thread skill projection.
+
+### Sandbox operations
+
 The full DeerFlow surface is implemented:
 
 - `execute_command` forwards per-call environment variables and positive
