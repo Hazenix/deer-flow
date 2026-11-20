@@ -27,7 +27,7 @@ async def test_latest_versions_cross_pages_and_single_thread_lookup(monkeypatch)
     await put(events, "t", "same", "current answer")
     corpus = GatewaySearchCorpus(threads, events, manager(), "alice")
     thread = await corpus.thread("t")
-    assert (await corpus.latest_message(thread, "same")).text == "current answer"
+    assert (await corpus.latest_messages(thread, {"same"}))["same"].text == "current answer"
     assert await corpus.around("t", "same", seq=1) is None
     window = await corpus.around("t", "same", seq=222, limit=50)
     assert len({row["content"]["id"] for row in window["data"]}) == len(window["data"])
@@ -37,6 +37,17 @@ async def test_latest_versions_cross_pages_and_single_thread_lookup(monkeypatch)
     result = await inspect.unwrap(search.message_context)("t", SimpleNamespace(), message_id="same", seq=222, limit=5)
     assert result["target_seq"] == 222
     threads.search.assert_not_called()
+
+    list_messages = events.list_messages
+
+    async def read_before_thread_recreation(*args, **kwargs):
+        rows = await list_messages(*args, **kwargs)
+        await threads.delete("t", user_id="alice")
+        await threads.create("t", user_id="alice")
+        return rows
+
+    monkeypatch.setattr(events, "list_messages", read_before_thread_recreation)
+    assert await corpus.latest_messages(thread, {"same"}) == {}
 
 
 @pytest.mark.anyio

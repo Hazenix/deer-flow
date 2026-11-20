@@ -244,6 +244,53 @@ async def test_http_search_and_jump_are_owner_bound_and_keep_title_contract(inde
         assert not (await client.post("/api/search", json={"query": "报告"})).json()["items"]
 
 
+@pytest.mark.anyio
+async def test_http_search_shares_history_scan_per_thread_in_each_provider_page():
+    from types import SimpleNamespace
+
+    from _router_auth_helpers import make_authed_test_app
+    from deerflow_extension_api.search import SearchMessage, SearchPage
+    from httpx import ASGITransport, AsyncClient
+
+    from app.gateway.auth.models import User
+    from app.gateway.routers import search
+
+    user = User(email="search@example.com")
+    app = make_authed_test_app(user_factory=lambda: user, bind_current_user=True)
+    app.include_router(search.router)
+    threads = app.state.thread_store = MemoryThreadMetaStore(InMemoryStore())
+    events = app.state.run_event_store = MemoryRunEventStore()
+    app.state.run_manager = manager()
+    long_thread = await threads.create("long", user_id=str(user.id))
+    short_thread = await threads.create("short", user_id=str(user.id))
+
+    async def add_candidate(thread, message_id):
+        row = await put(events, thread["thread_id"], message_id, f"needle {message_id}")
+        return SearchMessage(thread["thread_id"], thread["incarnation"], message_id, row["run_id"], row["seq"], "assistant", "indexed needle", row["created_at"])
+
+    first = await add_candidate(long_thread, "first")
+    second = await add_candidate(long_thread, "second")
+    stale = await add_candidate(long_thread, "stale")
+    for number in range(201):
+        await put(events, "long", f"middle-{number}", "other text")
+    await put(events, "long", "stale", "replacement")
+    other = await add_candidate(short_thread, "other")
+    refill = await add_candidate(short_thread, "refill")
+    provider_search = AsyncMock(side_effect=[SearchPage((first, other, second, stale), cursor="next"), SearchPage((refill,))])
+    app.state.extensions = SimpleNamespace(workspace_search_providers=(("test", SimpleNamespace(search=provider_search)),))
+    events.list_messages = AsyncMock(wraps=events.list_messages)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/search", json={"query": "needle", "types": ["message"], "limit": 4})
+
+    assert response.status_code == 200, response.text
+    hits = response.json()["items"]
+    assert [hit["message_id"] for hit in hits] == ["first", "other", "second", "refill"]
+    assert ["".join(part["text"] for part in hit["snippet"]) for hit in hits] == [f"needle {hit['message_id']}" for hit in hits]
+    assert [(call.kwargs["limit"], call.kwargs["cursor"]) for call in provider_search.await_args_list] == [(4, None), (1, "next")]
+    assert [(call.args[0], call.kwargs["before_seq"]) for call in events.list_messages.await_args_list] == [("long", None), ("long", 6), ("short", None), ("short", None)]
+
+
 def test_provider_registration_rolls_back_and_rejects_duplicates():
     from deerflow.extensions.registry import ExtensionRegistry
 

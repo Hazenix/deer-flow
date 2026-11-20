@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging
+from collections import defaultdict
 from dataclasses import asdict
 from typing import Literal
 
@@ -123,12 +124,19 @@ async def search_workspace(body: WorkspaceSearchRequest, request: Request):
             logger.exception("Workspace search provider failed")
             raise HTTPException(503, "Message search is temporarily unavailable") from None
         response["indexing"] = page.indexing
+        candidates = []
+        message_ids_by_thread: dict[str, set[str]] = defaultdict(set)
         for candidate in page.items:
             thread = lookup.get(candidate.thread_id)
-            if thread is None or candidate.incarnation != thread.incarnation or not await corpus.owns(thread):
+            if thread is None or candidate.incarnation != thread.incarnation:
                 continue
-            # Re-read authoritative visible text before returning ANY snippet.
-            current = await corpus.latest_message(thread, candidate.message_id)
+            candidates.append(candidate)
+            message_ids_by_thread[thread.thread_id].add(candidate.message_id)
+        # Share the authoritative history scan per thread, then emit in provider order.
+        latest_by_thread = {thread_id: await corpus.latest_messages(lookup[thread_id], message_ids) for thread_id, message_ids in message_ids_by_thread.items()}
+        for candidate in candidates:
+            thread = lookup[candidate.thread_id]
+            current = latest_by_thread[thread.thread_id].get(candidate.message_id)
             if current is None or current.seq != candidate.seq or query.casefold() not in current.text.casefold():
                 continue
             hit = thread_hit(thread)

@@ -158,15 +158,28 @@ class GatewaySearchCorpus:
             before = rows[0]["seq"]
         return sorted(latest.values(), key=lambda row: row["seq"])
 
-    async def latest_message(self, thread: SearchThread, message_id: str) -> SearchMessage | None:
-        if not await self.owns(thread):
-            return None
+    async def latest_messages(self, thread: SearchThread, message_ids: set[str]) -> dict[str, SearchMessage]:
+        """Resolve requested IDs in one backward pass over the visible history."""
+        if not message_ids or not await self.owns(thread):
+            return {}
+        pending = {f"message:{message_id}" for message_id in message_ids}
+        matches = {}
         before = None
-        while True:
+        while pending:
             rows, more = await self._page(thread.thread_id, limit=200, before_seq=before)
             for row in reversed(rows):
-                if message_identity(row["content"]) == f"message:{message_id}":
-                    return self.project(thread, row)
+                identity = message_identity(row["content"])
+                if identity is None or identity not in pending:
+                    continue
+                pending.remove(identity)
+                if (message := self.project(thread, row)) is not None:
+                    matches[message.message_id] = message
+                if not pending:
+                    break
             if not more:
-                return None
+                break
             before = rows[0]["seq"]
+        # The thread may have been deleted or recreated during the scan.
+        if matches and not await self.owns(thread):
+            return {}
+        return matches
