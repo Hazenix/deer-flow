@@ -38,6 +38,40 @@ async def test_active_input_run_orders_legacy_rows_without_the_active_run_index(
 
 
 @pytest.mark.asyncio
+async def test_list_input_runs_returns_only_polling_fields_in_order(tmp_path):
+    from deerflow.persistence.run.model import RunRow
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'input-poll.db'}")
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            for run_id, day, user_id, thread_id, items, stop_reason in [
+                ("old", 1, USER_ID, "thread", [{"id": "first"}], None),
+                ("new", 2, USER_ID, "thread", [{"id": "second"}], "stopped"),
+                ("empty", 3, USER_ID, "thread", [], None),
+                ("foreign", 4, "other-user", "thread", [{"id": "private"}], None),
+                ("other-thread", 5, USER_ID, "elsewhere", [{"id": "elsewhere"}], None),
+            ]:
+                await connection.execute(
+                    RunRow.__table__.insert().values(
+                        run_id=run_id,
+                        thread_id=thread_id,
+                        user_id=user_id,
+                        status="success",
+                        stop_reason=stop_reason,
+                        created_at=datetime(2026, 1, day, tzinfo=UTC),
+                        run_inputs_json={"closed": True, "items": items},
+                        kwargs_json={"request": "large request body must stay out of polling"},
+                    )
+                )
+        store = RunRepository(async_sessionmaker(engine, expire_on_commit=False))
+        assert await store.list_input_runs("thread", user_id=USER_ID, limit=1) == [{"run_id": "new", "status": "success", "stop_reason": "stopped", "run_inputs": {"closed": True, "items": [{"id": "second"}]}}]
+        assert [row["run_id"] for row in await store.list_input_runs("thread", user_id=USER_ID)] == ["new", "old"]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_input_migration_preserves_existing_runs_on_upgrade_and_rollback(tmp_path):
     from deerflow.persistence import bootstrap
     from deerflow.persistence.run.model import RunRow

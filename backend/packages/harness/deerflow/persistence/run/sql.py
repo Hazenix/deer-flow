@@ -77,11 +77,11 @@ class RunRepository(RunStore):
 
     async def list_input_runs(self, thread_id, *, user_id=None, limit=10):
         async with self._sf() as session:
-            query = select(RunRow).where(RunRow.thread_id == thread_id, RunRow.run_inputs_json["items"][0]["id"].as_string().is_not(None))
+            query = select(RunRow.run_id, RunRow.status, RunRow.stop_reason, RunRow.run_inputs_json.label("run_inputs")).where(RunRow.thread_id == thread_id, RunRow.run_inputs_json["items"][0]["id"].as_string().is_not(None))
             if user_id is not None:
                 query = query.where(RunRow.user_id == user_id)
             rows = await session.execute(query.order_by(RunRow.created_at.desc(), RunRow.run_id.desc()).limit(limit))
-            return [self._row_to_dict(row) for row in rows.scalars()]
+            return [dict(row) for row in rows.mappings()]
 
     async def active_input_run(self, thread_id, *, user_id=None):
         async with self._sf() as session:
